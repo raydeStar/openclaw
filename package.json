@@ -1583,6 +1583,7 @@
     "./plugin-sdk/llm": {
       "default": "./dist/plugin-sdk/llm.js"
     },
+    "./internal/discord-runtime-setter": "./dist/extensions/discord/runtime-setter-api.js",
     "./cli-entry": "./openclaw.mjs"
   },
   "scripts": {
