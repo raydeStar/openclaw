@@ -8,14 +8,9 @@ import {
   dispatchWithContext,
   requireInvocationOrder,
 } from "./bot-message-dispatch.test-harness.js";
-import type { TelegramMessageContext } from "./bot-message-dispatch.test-harness.js";
 
 describeTelegramDispatch("dispatchTelegramMessage status-reactions", () => {
   it("does not send visible error fallbacks for room events", async () => {
-    const historyKey = "telegram:group:-100123";
-    const groupHistories = new Map([
-      [historyKey, [{ sender: "Alice", body: "quiet failure", timestamp: 1 }]],
-    ]);
     dispatchReplyWithBufferedBlockDispatcher.mockRejectedValue(new Error("provider down"));
 
     await dispatchWithContext({
@@ -28,23 +23,21 @@ describeTelegramDispatch("dispatchTelegramMessage status-reactions", () => {
           RawBody: "ambient failure",
           BodyForAgent: "ambient failure",
           CommandBody: "ambient failure",
-        } as unknown as TelegramMessageContext["ctxPayload"],
+          CommandAuthorized: false,
+        },
         msg: {
-          chat: { id: -100123, type: "supergroup" },
+          chat: { id: -100123, type: "supergroup", title: "Room" },
           message_id: 101,
-        } as unknown as TelegramMessageContext["msg"],
+          date: 1_700_000_000,
+        },
         chatId: -100123,
         isGroup: true,
-        historyKey,
-        historyLimit: 10,
-        groupHistories,
         threadSpec: { id: undefined, scope: "none" },
       }),
       streamMode: "partial",
     });
 
     expect(deliverReplies).not.toHaveBeenCalled();
-    expect(groupHistories.get(historyKey)).toHaveLength(1);
   });
 
   it("shows compacting reaction during auto-compaction and resumes thinking", async () => {

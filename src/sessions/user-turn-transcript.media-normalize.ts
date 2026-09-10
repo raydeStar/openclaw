@@ -70,5 +70,6 @@ export function normalizeStructuredMediaEntryForTranscript(
     ...(messageId ? { messageId } : {}),
     ...(workspaceDir ? { workspaceDir } : {}),
     ...(media.hydrationSuppressed === true ? { hydrationSuppressed: true } : {}),
+    ...(media.contextOnly === true ? { contextOnly: true } : {}),
   };
 }

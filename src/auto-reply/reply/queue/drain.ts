@@ -43,6 +43,7 @@ import {
   previewQueueSummaryPrompt,
   waitForQueueDebounce,
 } from "../../../utils/queue-helpers.js";
+import { projectObservedReplyMedia } from "../observed-reply-input.js";
 import { isRoutableChannel } from "../route-reply.js";
 import { clearFollowupQueue, FOLLOWUP_QUEUES, trimSummaryElisionsToCap } from "./state.js";
 import {
@@ -468,13 +469,12 @@ function splitCollectItemsByDeliveryContext(items: FollowupRun[]): FollowupRun[]
 }
 
 function renderCollectItem(item: FollowupRun, idx: number): string {
+  const message = item.userTurnTranscriptRecorder?.getPendingInputMessage?.();
+  const prompt = resolveCollectedSourceText(message, item.prompt);
   return renderCollectItemPrompt(
     item,
     idx,
-    resolveCollectedSourceText(
-      item.userTurnTranscriptRecorder?.getPendingInputMessage?.(),
-      item.prompt,
-    ),
+    message ? projectObservedReplyMedia(message, prompt) : prompt,
   );
 }
 

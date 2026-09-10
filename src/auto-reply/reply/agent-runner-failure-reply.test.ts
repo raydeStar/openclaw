@@ -49,6 +49,17 @@ describe("buildEmptyInteractiveReplyPayload", () => {
 });
 
 describe("buildExternalRunFailureReply", () => {
+  it("shows safe input recovery copy without exposing diagnostics in a group", () => {
+    const userMessage = "Unread conversation is too large. Use /new to start fresh.";
+    const error = new AgentHarnessPreflightError("private diagnostic", { userMessage });
+    const reply = buildExternalRunFailureReply({ message: error.message, error });
+    expect(
+      resolveExternalRunFailureTextForConversation({
+        ...reply,
+        sessionCtx: { Provider: "discord", Surface: "discord", ChatType: "group" },
+      }),
+    ).toBe(userMessage);
+  });
   it("includes heartbeat preflight reasons without verbose opt-in", () => {
     const message =
       "Codex session became active in another runner; wait for it to finish before continuing";

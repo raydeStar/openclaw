@@ -13,6 +13,7 @@ import {
   readPersistedImageBlockFactIndexes,
   type ImageFactIndex,
 } from "../../agents/embedded-agent-runner/run/prompt-image-metadata.js";
+import { AgentHarnessPreflightError } from "../../agents/harness/errors.js";
 import { resolveImageSanitizationLimits } from "../../agents/image-sanitization.js";
 import type { AgentMessage } from "../../agents/runtime/index.js";
 import type { SessionPlacementTurnParams } from "../../agents/session-placement-admission.js";
@@ -22,7 +23,11 @@ import { resolvePreferredOpenClawTmpDir } from "../../infra/tmp-openclaw-dir.js"
 import { logWarn } from "../../logger.js";
 import { readLocalMediaFile } from "../../media/local-media-access.js";
 import { getAgentScopedMediaLocalRoots } from "../../media/local-roots.js";
-import { readPersistedMediaFacts, type MediaFact } from "../../media/media-facts.js";
+import {
+  readPersistedMediaFacts,
+  readRuntimePromptMediaFacts,
+  type MediaFact,
+} from "../../media/media-facts.js";
 import { resolveMediaReferenceLocalPath } from "../../media/media-reference.js";
 import {
   ensureStagedInputDirectory,
@@ -96,6 +101,7 @@ export async function prepareWorkerTurnMedia(params: {
     (await turn.userTurnTranscriptRecorder?.resolveMessage());
   assertCurrent();
   const recordedMedia = recorded ? readPersistedMediaFacts(recorded) : undefined;
+  const runtimeMedia = recorded ? readRuntimePromptMediaFacts(recorded) : undefined;
   const media = recordedMedia?.length ? recordedMedia : (turn.media ?? []);
   const localWorkspace = params.workspace.kind === "local" ? params.workspace.path : undefined;
   const workspaceOnly = resolveEffectiveToolFsWorkspaceOnly({
@@ -125,7 +131,7 @@ export async function prepareWorkerTurnMedia(params: {
     prompt: turn.prompt,
     existingImages: turn.images,
     imageOrder: turn.imageOrder,
-    media,
+    media: runtimeMedia ?? media,
     mediaImageLayout: recorded ? readPersistedMediaImageLayout(recorded) : undefined,
   });
   assertCurrent();
@@ -163,7 +169,7 @@ export async function prepareWorkerTurnMedia(params: {
   );
   const inputs = [current, ...replay.values()];
   // Stable names preserve edits; the same projection is used for first input and replay.
-  const projectedPaths = new Map<string, string>();
+  const projectedPaths = new Map<string, string | null>();
   let staging: Awaited<ReturnType<typeof tempWorkspace>> | undefined;
   try {
     let bytes = 0;
@@ -200,12 +206,27 @@ export async function prepareWorkerTurnMedia(params: {
       return remotePath;
     };
     for (const input of inputs) {
-      for (const fact of input.media) {
+      for (const [factIndex, fact] of input.media.entries()) {
         const ref = resolveMediaFactLocalRef(fact);
         if (!ref) {
           continue;
         }
+        const runtimeFact = input === current ? runtimeMedia?.[factIndex] : undefined;
+        const aliases = [
+          ref.raw,
+          ref.resolved,
+          fact.path,
+          fact.url,
+          runtimeFact?.path,
+          runtimeFact?.url,
+        ];
         let remotePath = projectedPaths.get(ref.raw);
+        if (remotePath === null) {
+          if (input === current && fact.contextOnly !== true) {
+            throw new Error("Current attachment is unavailable; resend the attachment and retry.");
+          }
+          continue;
+        }
         if (!remotePath) {
           let source: string;
           let data: Buffer;
@@ -220,21 +241,27 @@ export async function prepareWorkerTurnMedia(params: {
             });
           } catch (error) {
             assertCurrent();
-            if (input === current) {
+            if (input === current && fact.contextOnly !== true) {
               throw error;
             }
             // Retention can expire replay sources; only current input requires availability.
             // Keep authority checks and staging/transfer failures outside this omission policy.
             logWarn("worker-media: Omitted an unavailable historical attachment source");
+            for (const alias of aliases) {
+              if (alias) {
+                projectedPaths.set(alias, null);
+              }
+            }
             continue;
           }
           assertCurrent();
           const identity = createHash("sha256").update(source).digest("hex");
           remotePath = await stageFile(data, identity, path.basename(source));
-          for (const alias of [ref.raw, ref.resolved, source, fact.path, fact.url]) {
-            if (alias) {
-              projectedPaths.set(alias, remotePath);
-            }
+          projectedPaths.set(source, remotePath);
+        }
+        for (const alias of aliases) {
+          if (alias) {
+            projectedPaths.set(alias, remotePath);
           }
         }
         input.files.add(remotePath);
@@ -265,7 +292,10 @@ export async function prepareWorkerTurnMedia(params: {
   const projectText = (text: string) => {
     let projected = text;
     for (const [source, destination] of projectedPaths) {
-      projected = projected.replaceAll(source, destination);
+      projected = projected.replaceAll(
+        source,
+        destination ?? "[attachment unavailable; ask the sender to resend it]",
+      );
     }
     return projected;
   };
@@ -296,9 +326,10 @@ export async function prepareWorkerTurnMedia(params: {
   if (
     !isWorkerTranscriptMessageFrameSafe({ role: "user", content: prompt, timestamp: Date.now() })
   ) {
-    throw new Error(
-      "Cloud worker input exceeds its 25 MiB image or 64 KiB text/control limit; send fewer or smaller attachments.",
-    );
+    const userMessage =
+      "This request and its unread conversation exceed the worker's 64 KiB text or 25 MiB image limit. " +
+      "Use /new to start fresh without unread conversation, then send a shorter request or smaller attachments.";
+    throw new AgentHarnessPreflightError(userMessage, { userMessage });
   }
   return {
     images: currentImages.images,

@@ -4,6 +4,7 @@ import { IMAGE_BLOCK_TOKENS } from "openclaw/plugin-sdk/agent-core";
  * preserving safety boundaries and redacting tool payloads.
  */
 import {
+  AgentHarnessPreflightError,
   isOpenClawRuntimeContextCustomMessage,
   type AgentMessage,
 } from "openclaw/plugin-sdk/agent-harness-runtime";
@@ -254,7 +255,7 @@ export function fitCodexProjectedContextForTurnStart(params: {
     typeof params.maxChars === "number" && Number.isFinite(params.maxChars)
       ? Math.max(0, Math.floor(params.maxChars))
       : CODEX_TURN_START_TEXT_INPUT_MAX_CHARS;
-  if (params.promptText.length <= maxChars) {
+  if (params.promptText.length <= maxChars || countTextCharacters(params.promptText) <= maxChars) {
     return params.promptText;
   }
   const range = normalizeProjectedContextRange(params.contextRange, params.promptText.length);
@@ -264,17 +265,18 @@ export function fitCodexProjectedContextForTurnStart(params: {
       params.promptText.length,
     );
     if (!preservedRange) {
-      return params.promptText;
+      throwInputTooLarge(maxChars);
     }
     const preservedText = params.promptText.slice(preservedRange.start, preservedRange.end);
     if (!preservedText) {
       return truncateOlderContext(params.promptText, maxChars);
     }
-    if (preservedText.length >= maxChars) {
-      return truncateOlderContext(preservedText, maxChars);
+    const preservedChars = countTextCharacters(preservedText);
+    if (preservedChars > maxChars) {
+      throwInputTooLarge(maxChars);
     }
     const beforeRange = params.promptText.slice(0, preservedRange.start);
-    return `${truncateOlderContext(beforeRange, maxChars - preservedText.length)}${preservedText}`;
+    return `${truncateOlderContext(beforeRange, maxChars - preservedChars)}${preservedText}`;
   }
 
   const beforeContext = params.promptText.slice(0, range.start);
@@ -290,21 +292,26 @@ export function fitCodexProjectedContextForTurnStart(params: {
     requestRange.end < params.promptText.length
   ) {
     const request = params.promptText.slice(requestRange.start, requestRange.end);
-    if (request.length >= maxChars) {
-      return truncateOlderContext(request, maxChars);
+    const requestChars = countTextCharacters(request);
+    if (requestChars > maxChars) {
+      throwInputTooLarge(maxChars);
     }
     const appendedContext = params.promptText.slice(requestRange.end);
     // Hook-appended context is newer than the projected history. Retain it
     // before trimming the projection, while the full current request remains
     // the hard boundary that must survive a bounded turn/start input.
-    const fittedAppendedContext = truncateOlderContext(appendedContext, maxChars - request.length);
-    const contextBudget = maxChars - request.length - fittedAppendedContext.length;
+    const fittedAppendedContext = truncateOlderContext(appendedContext, maxChars - requestChars);
+    const contextBudget = maxChars - requestChars - fittedAppendedContext.length;
     const fittedContext = truncateOlderContext(context, contextBudget);
     const beforeContextBudget =
-      maxChars - fittedContext.length - request.length - fittedAppendedContext.length;
+      maxChars - fittedContext.length - requestChars - fittedAppendedContext.length;
     return `${truncateOlderContext(beforeContext, beforeContextBudget)}${fittedContext}${request}${fittedAppendedContext}`;
   }
-  const contextBudget = maxChars - beforeContext.length - afterContext.length;
+  const afterContextChars = countTextCharacters(afterContext);
+  if (afterContextChars > maxChars) {
+    throwInputTooLarge(maxChars);
+  }
+  const contextBudget = maxChars - beforeContext.length - afterContextChars;
   if (contextBudget > 0) {
     const fittedContext = truncateOlderContext(context, contextBudget);
     return `${beforeContext}${fittedContext}${afterContext}`;
@@ -312,10 +319,25 @@ export function fitCodexProjectedContextForTurnStart(params: {
   // Hook-added prefixes can make the non-context text exceed the limit. Keep
   // the current context tail before the user's request; dropping it would make
   // a duplicated earlier projection crowd out the newest assembled context.
-  const afterContextText = truncateOlderContext(afterContext, maxChars);
-  const contextBudgetAfterRequest = maxChars - afterContextText.length;
+  const contextBudgetAfterRequest = maxChars - afterContextChars;
   const fittedContext = truncateOlderContext(context, contextBudgetAfterRequest);
-  return `${fittedContext}${afterContextText}`;
+  return `${fittedContext}${afterContext}`;
+}
+
+function countTextCharacters(text: string): number {
+  let count = 0;
+  for (let index = 0; index < text.length;) {
+    index += text.codePointAt(index)! > 0xffff ? 2 : 1;
+    count += 1;
+  }
+  return count;
+}
+
+function throwInputTooLarge(maxChars: number): never {
+  const userMessage =
+    `This request and its unread conversation exceed the ${maxChars.toLocaleString("en-US")}-character input limit. ` +
+    "Nothing was sent. Use /new to start fresh without unread conversation, then send a shorter request.";
+  throw new AgentHarnessPreflightError(userMessage, { userMessage });
 }
 
 function normalizeProjectedContextRange(

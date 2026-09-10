@@ -1,4 +1,5 @@
 import type { OpenClawConfig } from "../types.openclaw.js";
+import type { ConversationHistoryCapture } from "./conversation-history.js";
 import type { ConversationRouteContext } from "./conversation-route-context.js";
 import type { SessionStateDeleteSnapshot } from "./session-accessor.sqlite-delete-snapshot.types.js";
 import type { SessionResetBoundaryRequest } from "./session-reset-boundary-event.js";
@@ -155,6 +156,7 @@ export type SessionEntryLifecycleUpsert = {
   /** Authoritative route observation for this write; omitted writes preserve valid evidence. */
   routeContext?: ConversationRouteContext | null;
   resetBoundary?: SessionResetBoundaryWrite;
+  conversationHistoryReset?: ConversationHistoryCapture;
 } & (
   | {
       entry: SessionEntry;

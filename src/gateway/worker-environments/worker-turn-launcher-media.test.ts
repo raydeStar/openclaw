@@ -6,6 +6,11 @@ import {
   createSolidPngBuffer,
 } from "../../../test/helpers/image-fixtures.js";
 import { makeAgentAssistantMessage } from "../../agents/test-helpers/agent-message-fixtures.js";
+import { recordConversationObservationCore } from "../../config/sessions/conversation-history.js";
+import {
+  commitReplySessionInitialization,
+  loadReplySessionInitializationSnapshot,
+} from "../../config/sessions/session-accessor.js";
 import {
   claimAgentRunDelegatedAuthority,
   releaseAgentRunDelegatedAuthority,
@@ -13,7 +18,11 @@ import {
 } from "../../infra/agent-run-registry.js";
 import * as rootLogger from "../../logger.js";
 import * as localMediaAccess from "../../media/local-media-access.js";
-import { readPersistedMediaFacts } from "../../media/media-facts.js";
+import {
+  attachRuntimePromptMediaFacts,
+  readPersistedMediaFacts,
+  type MediaFact,
+} from "../../media/media-facts.js";
 import * as mediaReferences from "../../media/media-reference.js";
 import { cleanOldMedia, saveMediaBuffer } from "../../media/store.js";
 import {
@@ -136,6 +145,104 @@ function harness() {
 
 describe("cloud turn media boundary", () => {
   beforeEach(setupWorkerTurnLauncherTest);
+
+  it("rejects oversized observed input before worker handoff and allows a fresh reset", async () => {
+    seedActivePlacement();
+    const rig = harness();
+    const observe = (sourceId: string, text = sourceId) =>
+      recordConversationObservationCore(sessionTarget, {
+        conversationRef: "worker-input-limit",
+        sourceId,
+        message: { text },
+      });
+    await observe("large-history", `unread overflow marker ${"x".repeat(70_000)}`);
+    const capture = await observe("request");
+    const recorder = createUserTurnTranscriptRecorder({
+      input: { text: "request", idempotencyKey: "oversized-worker" },
+      target: { ...sessionTarget, sessionEntry: undefined },
+    });
+    await recorder.stageApproved!({
+      runId: "oversized-worker",
+      conversationHistory: capture,
+      assertCurrent: () => {},
+    });
+    const markSent = vi.spyOn(recorder, "markSentToProvider");
+    await expect(
+      rig.execute({
+        ...turn("oversized-worker"),
+        prompt: String(recorder.message!.content),
+        userTurnTranscriptRecorder: recorder,
+      }),
+    ).rejects.toMatchObject({
+      name: "AgentHarnessPreflightError",
+      userMessage: expect.stringContaining("64 KiB"),
+    });
+    expect(markSent).not.toHaveBeenCalled();
+    expect(rig.launches).toHaveLength(0);
+    recorder.finishPendingInput?.("cancelled");
+    const resetCapture = await observe("reset", "/new");
+    const snapshot = loadReplySessionInitializationSnapshot(sessionTarget);
+    const reset = await commitReplySessionInitialization({
+      ...sessionTarget,
+      activeSessionKey: sessionTarget.sessionKey,
+      expectedRevision: snapshot.revision,
+      sessionEntry: snapshot.currentEntry!,
+      resetBoundary: { context: "clear", reason: "new", cwd: root },
+      conversationHistoryReset: resetCapture,
+    });
+    expect(reset.ok).toBe(true);
+    const next = createUserTurnTranscriptRecorder({
+      input: { text: "after reset", idempotencyKey: "after-reset" },
+      target: { ...sessionTarget, sessionEntry: undefined },
+    });
+    await next.stageApproved!({
+      runId: "after-reset",
+      conversationHistory: await observe("after-reset"),
+      assertCurrent: () => {},
+    });
+    expect(String(next.message!.content)).not.toContain("unread overflow marker");
+    next.finishPendingInput?.("cancelled");
+  });
+
+  it("stages lazy background aliases and reports expired files without blocking current text", async () => {
+    seedActivePlacement();
+    const rig = harness();
+    const image = createSolidPngBuffer(2, 2, { r: 0, g: 255, b: 0 });
+    const saved = await saveMediaBuffer(image, "image/png", "inbound");
+    const expiredPath = path.join(path.dirname(saved.path), "expired-report.txt");
+    const localStagedPath = path.join(root, "staged-report.txt");
+    const media: MediaFact[] = [
+      { path: saved.path, contentType: "image/png", contextOnly: true, hydrationSuppressed: true },
+      {
+        path: expiredPath,
+        contentType: "text/plain",
+        contextOnly: true,
+        hydrationSuppressed: true,
+      },
+    ];
+    const canonicalPrompt = `Earlier files: ${saved.path} ${expiredPath}\nCurrent request: summarize`;
+    const recorder = createUserTurnTranscriptRecorder({
+      target: { ...sessionTarget, sessionEntry: undefined },
+      input: { text: canonicalPrompt, media },
+    });
+    const message = (await recorder.resolveMessage())!;
+    attachRuntimePromptMediaFacts(message, [{ ...media[0], path: localStagedPath }, media[1]!]);
+    await rig.execute({
+      ...turn("lazy-background"),
+      prompt: canonicalPrompt.replace(saved.path, localStagedPath),
+      userTurnTranscriptRecorder: recorder,
+      modelHasVision: true,
+    });
+    const prompt = rig.launches[0]?.assignment.prompt;
+    expect(typeof prompt).toBe("string");
+    expect(prompt).toContain("Current request: summarize");
+    expect(prompt).toContain("attachment unavailable");
+    expect(prompt).not.toContain(localStagedPath);
+    expect(prompt).not.toContain(saved.path);
+    expect([...rig.inputFiles().values()]).toEqual([image]);
+    expect(String(message.content)).toBe(canonicalPrompt);
+    expect(readPersistedMediaFacts(message)?.[0]?.path).toBe(saved.path);
+  });
   afterEach(async () => {
     vi.restoreAllMocks();
     await cleanupWorkerTurnLauncherTest();
